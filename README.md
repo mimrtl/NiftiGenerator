@@ -1,3 +1,4 @@
+# NiftiGenerator
 NiftiGenerator is a tool to ingest Nifti images using Nibabel, apply basic augmentation, and utilize them as inputs to a deep learning model
 
 Data is sampled as fixed-size chunks. The chunks can be as small as you would like or as large as an entire image.
