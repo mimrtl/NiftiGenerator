@@ -57,3 +57,10 @@ More advanced things:
                 Note that this is slow because it requires loading the whole Nifti volume
         3. During the sampling of each batch by passing the additional function batchTransformFunction to the initialize call.
                 This function will be called right before each batch is returned. The transform function should preserve the size of the batch. 
+
+Alternatives:
+    There are a number of other alternatives that you should consider:
+    
+    TorchIO - https://github.com/fepegar/torchio
+    nifti_image_generator - https://github.com/sremedios/nifti_image_generator
+    
