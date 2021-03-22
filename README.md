@@ -7,7 +7,7 @@ Sampling of each chunk of data is performed after any augmentation.
 please see the source code for implementation details. Basic implementations are as follows:
 
 SingleNiftiGenerator -- To use for generating a single input into your model, do something like the following:
-`
+```
     # define the NiftiGenerator
     niftiGen = NiftiGenerator.SingleNiftiGenerator()
     # get augmentation options (see help for get_default_augOptions for more details! )
@@ -22,10 +22,10 @@ SingleNiftiGenerator -- To use for generating a single input into your model, do
     ## in your training function you will then call something like:
     NiftiGenerator.generate_chunks( niftiGen, chunk_size=(128,128,5), batch_size=16 ) 
     ## to generate a batch of 16, 128x128x5 chunks of data
-`
+```
 
 PairedNiftiGenerator -- To use for generating paired inputs into your model, do something like the following:
-`
+```
     # define the NiftiGenerator
     niftiGen = NiftiGenerator.PairedNiftiGenerator()
     # get augmentation options (see help for get_default_augOptions for more details! )
@@ -45,7 +45,7 @@ PairedNiftiGenerator -- To use for generating paired inputs into your model, do 
     ## in your training function you will then call something like:
     NiftiGenerator.generate_chunks( niftiGen, chunk_size=(32,32,32), batch_size=64 ) 
     ## to generate a batch of 64, 32x32x32 chunks of paired data
-`
+```
 
 More advanced things:
     The NiftiGenerators are designed to allow flexible callbacks at various places to do more advanced things to the input data.
