@@ -59,8 +59,9 @@ More advanced things:
                 This function will be called right before each batch is returned. The transform function should preserve the size of the batch. 
 
 Alternatives:
-    There are a number of other alternatives that you should consider:
+
+There are a number of other alternatives that you should consider:
     
-    TorchIO - https://github.com/fepegar/torchio
-    nifti_image_generator - https://github.com/sremedios/nifti_image_generator
+* TorchIO - https://github.com/fepegar/torchio
+* nifti_image_generator - https://github.com/sremedios/nifti_image_generator
     
