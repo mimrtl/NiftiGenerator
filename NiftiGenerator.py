@@ -1,5 +1,9 @@
 """NiftiGenerator is a tool to ingest Nifti images using Nibabel, apply basic augmentation, and utilize them as inputs to a deep learning model
 
+Data is sampled as fixed-size chunks. The chunks can be as small as you would like or as large as an entire image.
+Augmentation is currently only 2D (not performed on the 3rd dimension of the input images in consideration of non-isotropic input data).
+Sampling of each chunk of data is performed after any augmentation.
+
 # please see the source code for implementation details. Basic implementations are as follows:
 
 # SingleNiftiGenerator -- To use for generating a single input into your model, do something like the following:
@@ -50,9 +54,6 @@
                 Note that this is slow because it requires loading the whole Nifti volume
         3. During the sampling of each batch by passing the additional function batchTransformFunction to the initialize call.
                 This function will be called right before each batch is returned. The transform function should preserve the size of the batch. 
-
-Good luck!
--Alan McMillan, University of Wisconsin
 
 """
 
