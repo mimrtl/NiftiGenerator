@@ -48,8 +48,10 @@ PairedNiftiGenerator -- To use for generating paired inputs into your model, do 
 ```
 
 More advanced things:
+
     The NiftiGenerators are designed to allow flexible callbacks at various places to do more advanced things to the input data.
     Custom functions can be used in three different places:
+    
         1. During augmentation using the augOptions.additionalFunction. This additional function will be called at the last step of the augmentation.
         2. During normalization using the normType ='function'. This function will be called to do the normalization of the input data.
                 Note that this is slow because it requires loading the whole Nifti volume
