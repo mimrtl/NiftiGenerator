@@ -1,3 +1,61 @@
+"""NiftiGenerator is a tool to ingest Nifti images using Nibabel, apply basic augmentation, and utilize them as inputs to a deep learning model
+
+# please see the source code for implementation details. Basic implementations are as follows:
+
+# SingleNiftiGenerator -- To use for generating a single input into your model, do something like the following:
+
+    # define the NiftiGenerator
+    niftiGen = NiftiGenerator.SingleNiftiGenerator()
+    # get augmentation options (see help for get_default_augOptions for more details! )
+    niftiGen_augment_opts = NiftiGenerator.SingleNiftiGenerator.get_default_augOptions()
+    niftiGen_augment_opts.hflips = True
+    niftiGen_augment_opts.vflips = True
+    # get normalization options ( see help for get_default_normOptions for more details! )
+    niftiGen_norm_opts = NiftiGenerator.SingleNiftiGenerator.get_default_normOptions()
+    niftiGen_norm_opts.normXtype = 'auto'
+    # initialize the generator (where x_data_train is either a path to a single folder or a list of Nifti files)
+    niftiGenTrain.initialize( x_data_train, augOptions=niftiGen_augment_opts, normOptions=niftiGen_norm_opts )
+    ## in your training function you will then call something like:
+    NiftiGenerator.generate_chunks( niftiGen, chunk_size=(128,128,5), batch_size=16 ) 
+    ## to generate a batch of 16, 128x128x5 chunks of data
+
+# PairedNiftiGenerator -- To use for generating paired inputs into your model, do something like the following:
+
+    # define the NiftiGenerator
+    niftiGen = NiftiGenerator.PairedNiftiGenerator()
+    # get augmentation options (see help for get_default_augOptions for more details! )
+    niftiGen_augment_opts = NiftiGenerator.PairedNiftiGenerator.get_default_augOptions()
+    niftiGen_augment_opts.hflips = True
+    niftiGen_augment_opts.vflips = True
+    niftiGen_augment_opts.rotations = 5
+    niftiGen_augment_opts.scalings = .1
+    # get normalization options ( see help for get_default_normOptions for more details! )
+    niftiGen_norm_opts = NiftiGenerator.PairedNiftiGenerator.get_default_normOptions()
+    niftiGen_norm_opts.normXtype = 'auto'
+    niftiGen_norm_opts.normYtype = 'fixed'
+    niftiGen_norm_opts.normYoffset = 0
+    niftiGen_norm_opts.normYscale = 50000
+    # initialize the generator (where x_data_train and y_data_train are either a paths to a single folder or lists of Nifti files)
+    niftiGen.initialize( x_data_train, y_data_train, augOptions=niftiGen_augment_opts, normOptions=niftiGen_norm_opts )
+    ## in your training function you will then call something like:
+    NiftiGenerator.generate_chunks( niftiGen, chunk_size=(32,32,32), batch_size=64 ) 
+    ## to generate a batch of 64, 32x32x32 chunks of paired data
+
+# More advanced things:
+
+    The NiftiGenerators are designed to allow flexible callbacks at various places to do more advanced things to the input data.
+    Custom functions can be used in three different places:
+        1. During augmentation using the augOptions.additionalFunction. This additional function will be called at the last step of the augmentation.
+        2. During normalization using the normType ='function'. This function will be called to do the normalization of the input data.
+                Note that this is slow because it requires loading the whole Nifti volume
+        3. During the sampling of each batch by passing the additional function batchTransformFunction to the initialize call.
+                This function will be called right before each batch is returned. The transform function should preserve the size of the batch. 
+
+Good luck!
+-Alan McMillan, University of Wisconsin
+
+"""
+
 import nibabel as nib
 import cv2
 from glob import glob
@@ -8,6 +66,7 @@ import numpy as np
 import logging
 from scipy.ndimage import affine_transform
 
+# set up logging
 module_logger = logging.getLogger(__name__)
 module_logger_handler = logging.StreamHandler()
 module_logger_formatter = logging.Formatter('%(asctime)s %(name)-12s %(levelname)-8s %(message)s')
@@ -15,16 +74,161 @@ module_logger_handler.setFormatter(module_logger_formatter)
 module_logger.addHandler(module_logger_handler)
 module_logger.setLevel(logging.INFO)
 
-# data generator for a single set of nifti files
+# ----------------------------------------------------------------------------------------------------------------------------------------------------------------
+# We will utilize a clever approach to enable pre-fetching of the generator.
+#   below we use code is from https://github.com/justheuristic/prefetch_generator/blob/master/prefetch_generator/__init__.py
+# ----------------------------------------------------------------------------------------------------------------------------------------------------------------
+import threading
+import sys
+import queue as Queue
+class BackgroundGenerator(threading.Thread):
+    def __init__(self, generator, max_prefetch=1):
+        """
+        This function transforms generator into a background-thead generator.
+        :param generator: generator or genexp or any
+        It can be used with any minibatch generator.
+        It is quite lightweight, but not entirely weightless.
+        Using global variables inside generator is not recommended (may rise GIL and zero-out the benefit of having a background thread.)
+        The ideal use case is when everything it requires is store inside it and everything it outputs is passed through queue.
+        There's no restriction on doing weird stuff, reading/writing files, retrieving URLs [or whatever] wlilst iterating.
+        :param max_prefetch: defines, how many iterations (at most) can background generator keep stored at any moment of time.
+        Whenever there's already max_prefetch batches stored in queue, the background process will halt until one of these batches is dequeued.
+        !Default max_prefetch=1 is okay unless you deal with some weird file IO in your generator!
+        Setting max_prefetch to -1 lets it store as many batches as it can, which will work slightly (if any) faster, but will require storing
+        all batches in memory. If you use infinite generator with max_prefetch=-1, it will exceed the RAM size unless dequeued quickly enough.
+        """
+        threading.Thread.__init__(self)
+        self.queue = Queue.Queue(max_prefetch)
+        self.generator = generator
+        self.daemon = True
+        self.start()
+        self.exhausted = False
+
+    def run(self):
+        for item in self.generator:
+            self.queue.put(item)
+        self.queue.put(None)
+
+    def next(self):
+        if self.exhausted:
+            raise StopIteration
+        else:
+            next_item = self.queue.get()
+            if next_item is None:
+                raise StopIteration
+            return next_item
+
+    # Python 3 compatibility
+    def __next__(self):
+        return self.next()
+
+    def __iter__(self):
+        return self
+
+#decorator
+class background:
+    def __init__(self, max_prefetch=1):
+        self.max_prefetch = max_prefetch
+    def __call__(self, gen):
+        def bg_generator(*args,**kwargs):
+            return BackgroundGenerator(gen(*args,**kwargs), max_prefetch=self.max_prefetch)
+        return bg_generator
+# ----------------------------------------------------------------------------------------------------------------------------------------------------------------
+# end prefetch_generator
+# ----------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------------------------------------------------------------------------------------------
+# utility functions to get multi-worker generators from SingleNiftiGenerators and PairedNiftiGenerators
+# ----------------------------------------------------------------------------------------------------------------------------------------------------------------
+def generate_chunks( single_niftigen, chunk_size=(32,32,32), batch_size=16, num_workers=4 ):
+    """realizes a multi-threaded pre-fetching generator to generate data from a SingleNiftiGenerator.
+    Arguments
+        single_niftigen - an initialized PairedNiftiGenerator 
+        chunk_size - a length-3 tuple, e.g., (32,32,32) that indicates the size of the sampled chunks
+        batch_size - the number of chunks to sample in a batch
+        num_workers - the number of workers (threads)
+    """
+
+    # we simply make an array of generators and call each one with a batch_size of 1
+    generators = []
+    for i in range(num_workers):
+        generators.append( single_niftigen.generate_chunks( chunk_size, batch_size=1 ) )
+
+    # store the batch of data
+    batch_X = np.zeros( [batch_size,chunk_size[0],chunk_size[1],chunk_size[2]] )
+
+    # loop through each pre-fetching generator to retrieve a full batch
+    curr_generator = 0
+    while True:
+        for i in range(batch_size):
+            curr_X = next(generators[curr_generator])
+
+            batch_X[i,:,:,:] = curr_X
+
+            curr_generator += 1
+            if curr_generator == num_workers:
+                curr_generator = 0
+
+        yield (batch_X)
+
+def generate_paired_chunks( paired_niftigen, chunk_size=(32,32,32), batch_size=16, num_workers=4 ):
+    """realizes a multi-threaded pre-fetching generator to generate data from a PairedNiftiGenerator.
+    Arguments
+        paired_niftigen - an initialized PairedNiftiGenerator 
+        chunk_size - a length-3 tuple, e.g., (32,32,32) that indicates the size of the sampled chunks
+        batch_size - the number of chunks to sample in a batch
+        num_workers - the number of workers (threads)
+    """
+
+    # we simply make an array of generators and call each one with a batch_size of 1
+    generators = []
+    for i in range(num_workers):
+        generators.append( paired_niftigen.generate_chunks( chunk_size, batch_size=1 ) )
+
+    # store the batches of data
+    batch_X = np.zeros( [batch_size,chunk_size[0],chunk_size[1],chunk_size[2]] )
+    batch_Y = np.zeros( [batch_size,chunk_size[0],chunk_size[1],chunk_size[2]] )
+
+    # loop through each pre-fetching generator to retrieve a full batch
+    curr_generator = 0
+    while True:
+        for i in range(batch_size):
+            curr_X,curr_Y = next(generators[curr_generator])
+
+            batch_X[i,:,:,:] = curr_X
+            batch_Y[i,:,:,:] = curr_Y
+
+            curr_generator += 1
+            if curr_generator == num_workers:
+                curr_generator = 0
+
+        yield (batch_X,batch_Y)
+# ----------------------------------------------------------------------------------------------------------------------------------------------------------------
+# end utility functions
+# ----------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------------------------------------------------------------------------------------------
+# SingleNiftiGenerator: data generator for a single (unpaired) set of nifti files
+# ----------------------------------------------------------------------------------------------------------------------------------------------------------------
 class SingleNiftiGenerator:
-    inputFilesX = []
+    """SingleNiftiGenerator
+    A generator that provides slices or patches of data from a set of Nifti files
+    """
     augOptions = types.SimpleNamespace()
     normOptions = types.SimpleNamespace()
-    normXready = []
-    normXoffset = []
-    normXscale = []
 
-    def initialize(self, inputX, augOptions=None, normOptions=None):
+    def initialize(self, inputX, augOptions=None, normOptions=None, batchTransformFunction=None):
+        """Initialize a SingleNiftiGenerator object.
+
+        Arguments
+            inputX - a valid folder containing Nifti (.nii or .nii.gz files)
+                        -or-
+                     a list of Nifti (.nii or .nii.gz) files
+            augOptions - a Augmentation Options namespace. See get_default_augOptions().
+            normOptions - a Normalization Options namespace. See get_default_normOptions().
+            batchTransformFunction - an optional user-specified function that takes a batch of data as its input and performs a
+                                    transformation, and returns new data in the same shape.
+        """
 
         # if input is a list, let's just use that
         # otherwise consider this input as a folder
@@ -50,9 +254,16 @@ class SingleNiftiGenerator:
 
         # handle normalization
         if self.normOptions.normXtype == 'auto'.lower():
+            module_logger.info( 'normalization is ''auto''. Computing normalizations now...' )
             self.normXready = [False] * num_Xfiles
             self.normXoffset = [0] * num_Xfiles
-            self.normXscale = [1] * num_Xfiles
+            self.normXscale = [1] * num_Xfiles            
+            for i in range(num_Xfiles):
+                Ximg = nib.load( self.inputFilesX[i] )
+                tmpX = Ximg.get_fdata()
+                self.normXoffset[i] = np.mean( tmpX )
+                self.normXscale[i] = np.std( tmpX )
+                self.normXready[i] = True
         elif self.normOptions.normXtype == 'fixed'.lower():
             self.normXready = [True] * num_Xfiles
             self.normXoffset = [self.normOptions.normXoffset] * num_Xfiles
@@ -67,135 +278,159 @@ class SingleNiftiGenerator:
             module_logger.error('Fatal Error: Normalization for X was specified as an unknown value.')
             sys.exit(1)
 
-    def generate(self, img_size=(256,256), slice_samples=1, batch_size=16):
+        # optional function to transform each batch
+        if batchTransformFunction is not None:
+            self.batchTransformFunction = batchTransformFunction
 
+        # set random seed
+        np.random.seed( augOptions.augseed)
+
+        # we are now initialized
+        self.initialized = True
+
+    @background(max_prefetch=1)
+    def generate_chunks( self, chunk_size=(32,32,32), batch_size=16 ):
+        """Get a prefetching generator to yield chunks of data.
+        Arguments
+            chunk_size - a length-3 tuple, e.g., (32,32,32) that indicates the size of the sampled chunks
+            batch_size - the number of chunks to sample in a batch
+        Yields
+            a batch of data from the NiftiGenerator
+        """
+        if not self.initialized:
+            module_logger.error('This NiftiGenerator is not initialized. Make sure to run initialize(...) first!')
         while True:
-            # create empty variables for this batch
-            batch_X = np.zeros( [batch_size,img_size[0],img_size[1],slice_samples] )
+            yield self.get_batch(chunk_size,batch_size)
+  
+    def get_batch(self, chunk_size=(32,32,32), batch_size=16):
+        """Get a batch of samples as chunks (samples can be the full image size if desired)
+        Arguments
+            chunk_size - a length-3 tuple, e.g., (32,32,32) that indicates the size of the sampled chunks
+            batch_size - the number of chunks to sample in a batch
+        Returns
+            a batch of paired data
+        """
+        # create empty variables for this batch
+        batch_X = np.zeros( [batch_size,chunk_size[0],chunk_size[1],chunk_size[2]] )
 
-            for i in range(batch_size):
-                # get a random subject
-                j = np.random.randint( 0, len(self.inputFilesX) )
-                currImgFileX = self.inputFilesX[j]
+        for i in range(batch_size):
+            # get a random subject
+            j = np.random.randint( 0, len(self.inputFilesX) )
+            currImgFileX = self.inputFilesX[j]
 
-                # load nifti header
-                module_logger.debug( 'reading file {}'.format(currImgFileX) )
-                Ximg = nib.load( currImgFileX )
+            # load nifti header
+            module_logger.debug( 'reading file {}'.format(currImgFileX) )
+            Ximg = nib.load( currImgFileX )
 
-                XimgShape = Ximg.header.get_data_shape()
+            XimgShape = Ximg.header.get_data_shape()
 
-                # determine sampling range
-                if slice_samples==1:
-                    z = np.random.randint( 0, XimgShape[2]-1 )
-                elif slice_samples==3:
-                    z = np.random.randint( 1, XimgShape[2]-2 )
-                elif slice_samples==5:
-                    z = np.random.randint( 2, XimgShape[2]-3 )
-                elif slice_samples==7:
-                    z = np.random.randint( 3, XimgShape[2]-4 )
-                elif slice_samples==9:
-                    z = np.random.randint( 4, XimgShape[2]-5 )
-                else:
-                    module_logger.error('Fatal Error: Number of slice samples must be 1, 3, 5, 7, or 9')
-                    sys.exit(1)
+            # determine sampling location
+            x = np.random.randint( 0, XimgShape[0] - chunk_size[0] - 1 )
+            y = np.random.randint( 0, XimgShape[1] - chunk_size[1] - 1 )
+            z = np.random.randint( 0, XimgShape[2] - chunk_size[2] - 1 )
 
-                module_logger.debug( 'sampling range is {}'.format(z) )                
+            xe = x + chunk_size[0]
+            ye = y + chunk_size[1]
+            ze = z + chunk_size[2]
 
-                 # handle input data normalization and sampling
-                if self.normOptions.normXtype == 'function'.lower():
-                    # normalization is performed via a specified function
-                    # get normalized data (and read whole volume)
-                    tmpX = self.normOptions.normXfunction( Ximg.get_fdata() )
-                    # sample data
-                    XimgSlices = tmpX[:,:,z-slice_samples//2:z+slice_samples//2+1]
-                else:
-                    # type is none, auto, or fixed
-                    # prepare normalization
-                    if not self.normXready[j]:
-                        tmpX = Ximg.get_fdata()
-                        self.normXoffset[j] = np.mean( tmpX )
-                        self.normXscale[j] = np.std( tmpX )
-                        self.normXready[j] = True
-                    # sample data
-                    XimgSlices = Ximg.slicer[:,:,z-slice_samples//2:z+slice_samples//2+1].get_fdata()
-                    # do normalization
-                    XimgSlices = (XimgSlices - self.normXoffset[j]) / self.normXscale[j]
+            # handle input data normalization and sampling
+            if self.normOptions.normXtype == 'function'.lower():
+                # normalization is performed via a specified function
+                # get normalized data (and read whole volume)
+                tmpX = self.normOptions.normXfunction( Ximg.get_fdata() )
+                # sample data
+                XimgSlices = tmpX[:,:,z:ze]
+            else:
+                # type is none, auto, or fixed, no computation should be needed
+                # sample data
+                XimgSlices = Ximg.dataobj[:,:,z:ze]
+                # do normalization
+                XimgSlices = (XimgSlices - self.normXoffset[j]) / self.normXscale[j]
 
-                # resize to fixed size for model (note img is resized with CUBIC)
-                XimgSlices = cv2.resize( XimgSlices, dsize=(img_size[1],img_size[0]), interpolation = self.normOptions.normXinterp )
+            # ensure 3D matrix if batch size is equal to 1
+            if XimgSlices.ndim == 2:
+                XimgSlices = XimgSlices[...,np.newaxis]
 
-                # ensure 3D matrix if batch size is equal to 1
-                if XimgSlices.ndim == 2:
-                    XimgSlices = XimgSlices[...,np.newaxis]
+            # augmentation here
+            M = self.get_augment_transform()
+            XimgSlices = self.do_augment( XimgSlices, M )
 
-                # augmentation here
-                M = self.get_augment_transform()
-                XimgSlices = self.do_augment( XimgSlices, M )
+            # sample chunk of data
+            XimgChunk = XimgSlices[x:xe,y:ye,:]
 
-                # if an additional augmentation function is supplied, apply it here
-                if self.augOptions.additionalFunction:
-                    XimgSlices = self.augOptions.additionalFunction( XimgSlices )
+            # put into data array for batch for this batch of samples
+            batch_X[i,:,:,:] = XimgChunk
 
-                # put into data array for batch for this batch of samples
-                batch_X[i,:,:,:] = XimgSlices
+        # optional additional transform to the batch of data
+        if self.batchTransformFunction:
+            batch_X = self.batchTransformFunction( batch_X )
 
-                yield( batch_X )
+        return( batch_X )
 
     def get_default_normOptions():
-        normOptions = types.SimpleNamespace()
-        # set normalization options
-        #  type can be 'none', 'auto', 'fixed', 'function'
-        # for none, no normalization is done
-        # for auto, a Z-score normalization is done on the Nifti volume to make mean=0, stdev=1
-        # for fixed, a specified offset and scaling factor is applied (data-offset)/scale
-        # for function, a python function is passed that takes the input data and returns a normalized version        
+        """Get a Normalization Options namespace for a SingleNiftiGenerator, with the default options
+        Returns
+            a normOptions namespace with the following structure:
+                normOptions.normXType = 'none', where the options are 'none', 'auto', 'fixed', and 'function'
+                                        for none, no normalization is done
+                                        for auto, a Z-score normalization is done on the Nifti volume to make mean=0, stdev=1
+                                        for fixed, a specified offset and scaling factor is applied (data-offset)/scale
+                                        for function, a python function is passed that takes the input data and returns a normalized version
+                normOptions.normXoffset = 0, where the value (floating point) is the offset applied to 'fixed' normalization, where the normalization is (data-normXoffset)/normXscale
+                normOptions.normXscale = 0, where the value (floating point) is the scale applied to 'fixed' normalization, where the normalization is (data-normXoffset)/normXscale
+                normOptions.normXfunction = None, where a user-specified function is specified that takes a single dataset as its input and performs a normalization and
+                                            returns new data in the same shape.
+                normOptions.normXinterp = cv2.INTER_CUBIC, which specifies the OpenCV interpolation method that is used when the augmentation transformation is applied.
+                                          valid types are cv2.INTER_NEAREST, cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_AREA, cv2.LANCZOS4, cv2.INTER_LINEAR_EXACT,
+                                              cv2.INTER_NEAREST_EXACT, cv2.INTER_MAX
+                                          see https://docs.opencv.org/3.4/da/d54/group__imgproc__transform.html for more information
+        """
+        normOptions = types.SimpleNamespace()    
         normOptions.normXtype = 'none'
         normOptions.normXoffset = 0
         normOptions.normXscale = 1
         normOptions.normXfunction = None
-        # interp can be any of the opencv interpolation types: https://docs.opencv.org/3.4/da/d54/group__imgproc__transform.html
-        # cv2.INTER_NEAREST, cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_AREA, cv2.LANCZOS4,
-        # cv2.INTER_LINEAR_EXACT, cv2.INTER_NEAREST_EXACT, cv2.INTER_MAX
         normOptions.normXinterp = cv2.INTER_CUBIC
 
         return normOptions
 
     def get_default_augOptions():
+        """Get an Augmentation Options namespace for a NiftiGenerator, with the default options
+        Returns
+            a normOptions namespace with the following structure:
+                augOptions.augmode = 'reflect', where the options are 'mirror','nearest','reflect','wrap' that defines how augmented data is extended beyond its boundaries.
+                                     scipy.ndimage documentation for more information
+                augOptions.augseed = 813, where the value (integer) is the random seed to enable reproducible augmentation
+                augOptions.addnoise = 0, where the value (floating point) is the sigma of mean zero Gaussian noise (see numpy.random.normal)
+                augOptions.hflips = False, where the value (True, False) indicates whether to perform random horizontal flips
+                augOptions.vflips = False, where the value (True, False) indicates whether to perform random vertical flips
+                augOptions.rotations = 0, where the value (floating point) specifies the random amount of rotations in degrees within the range [-rotations,rotations]
+                augOptions.scalings = 0, where the value (floating point) specifies the random amount of scaling within the range [(1-scale),(1+scale)]
+                augOptions.shears = 0, where the value (floating point) specifies the random amount of shears in degrees within the range [-shears,shears]
+                augOptions.translations = 0, where the value (integer) is the random amount of translations applied in the horizontal and vertical directions
+                                          within the range [-translations,translations]
+                augOptions.additionalFunction = None, where a user-specified function is specified that takes a single dataset as its input and performs augmentation
+                                                and returns new data in the same shape.
+        """
         augOptions = types.SimpleNamespace()
-        # augmode
-        ## choices=['mirror','nearest','reflect','wrap']
-        ## help='Determines how the augmented data is extended beyond its boundaries. See scipy.ndimage documentation for more information'
         augOptions.augmode = 'reflect'
-        # augseed
-        ## help='Random seed (as integer) to set for reproducible augmentation'
         augOptions.augseed = 813
-        # addnoise
-        ## help='Add Gaussian noise by this (floating point) factor'
         augOptions.addnoise = 0
-        # hflips
-        ## help='Perform random horizontal flips'
         augOptions.hflips = False
-        # vflips
-        ## help='Perform random horizontal flips'
         augOptions.vflips = False
-        # rotations
-        ## help='Perform random rotations up to this angle (in degrees)'
         augOptions.rotations = 0
-        # scalings
-        ## help='Perform random scalings between the range [(1-scale),(1+scale)]')
         augOptions.scalings = 0
-        # shears
-        ## help='Add random shears by up to this angle (in degrees)'
         augOptions.shears = 0
-        # translations
-        ## help='Perform random translations by up to this number of pixels'
         augOptions.translations = 0
-        # additional post-processing as function (run after augmentation)
         augOptions.additionalFunction = None
 
         return augOptions
 
     def get_augment_transform( self ):
+        """Internal function used to calculate the augmentation transform based on augOptions
+        Returns
+            M, an augmentation transform
+        """
         # use affine transformations as augmentation
         M = np.eye(3)
         # horizontal flips
@@ -253,6 +488,13 @@ class SingleNiftiGenerator:
         return M
 
     def do_augment( self, X, M ):
+        """Internal function used to apply augmentation to a specified image
+        Arguments
+            X, the input image
+            M, the transformation matrix, that applies a 2D transform slicewise to input X
+        Returns
+            the augmented image
+        """
         # now apply the transform
         X_ = np.zeros_like(X)
 
@@ -263,20 +505,41 @@ class SingleNiftiGenerator:
         if np.abs( self.augOptions.addnoise ) > 1e-10:
             noise_mean = 0
             noise_sigma = self.augOptions.addnoise
-            noise = np.random.normal( noise_mean, noise_sigma, X_[:,:,2].shape ) # [:,:,k] for k=0,1,2. Which k? output_shape was undefined 3rd arg here
-            for k in range(X_.shape[2]):
-                X_[:,:,k] = X_[:,:,k] + noise
+            noise = np.random.normal( noise_mean, noise_sigma, X_.shape ) # [:,:,k] for k=0,1,2. Which k? output_shape was undefined 3rd arg here
+            X_ += noise
+            
+        # if an additional augmentation function is supplied, apply it here
+        if self.augOptions.additionalFunction:
+            X_ = self.augOptions.additionalFunction( X_ )
 
         return X_
+# ----------------------------------------------------------------------------------------------------------------------------------------------------------------
+# end SingleNiftiGenerator
+# ----------------------------------------------------------------------------------------------------------------------------------------------------------------        
 
-# data generator for a paired set of nifti files
+# ----------------------------------------------------------------------------------------------------------------------------------------------------------------
+# PairedNiftiGenerator: data generator for paired sets of nifti files
+# ----------------------------------------------------------------------------------------------------------------------------------------------------------------
 class PairedNiftiGenerator(SingleNiftiGenerator):
-    inputFilesY = []
-    normYready = []
-    normYoffset = []
-    normYscale = []
+    """PairedNiftiGenerator
+    A generator that provides paired slices or patches of data from a set of paired Nifti files
+    """
 
-    def initialize(self, inputX, inputY, augOptions=None, normOptions=None):
+    def initialize(self, inputX, inputY, augOptions=None, normOptions=None, batchTransformFunction=None):
+        """Initialize a DoubleNiftiGenerator object.
+
+        Arguments
+            inputX - a valid folder containing Nifti (.nii or .nii.gz files)
+                        -or-
+                     a list of Nifti (.nii or .nii.gz) files
+            inputY - a valid folder containing Nifti (.nii or .nii.gz files)
+                        -or-
+                     a list of Nifti (.nii or .nii.gz) files                     
+            augOptions - a Augmentation Options namespace. See get_default_augOptions().
+            normOptions - a Normalization Options namespace. See get_default_normOptions().
+            batchTransformFunction - an optional user-specified function that takes a batch of data as its input and performs a
+                                    transformation, and returns new data in the same shape.
+        """
 
         # if input is a list, let's just use that
         # otherwise consider this input as a folder
@@ -313,9 +576,16 @@ class PairedNiftiGenerator(SingleNiftiGenerator):
 
         # handle normalization
         if self.normOptions.normXtype == 'auto'.lower():
+            module_logger.info( 'X normalization is ''auto''. Computing normalizations now...' )
             self.normXready = [False] * num_Xfiles
             self.normXoffset = [0] * num_Xfiles
-            self.normXscale = [1] * num_Xfiles
+            self.normXscale = [1] * num_Xfiles            
+            for i in range(num_Xfiles):
+                Ximg = nib.load( self.inputFilesX[i] )
+                tmpX = Ximg.get_fdata()
+                self.normXoffset[i] = np.mean( tmpX )
+                self.normXscale[i] = np.std( tmpX )
+                self.normXready[i] = True
         elif self.normOptions.normXtype == 'fixed'.lower():
             self.normXready = [True] * num_Xfiles
             self.normXoffset = [self.normOptions.normXoffset] * num_Xfiles
@@ -331,9 +601,16 @@ class PairedNiftiGenerator(SingleNiftiGenerator):
             sys.exit(1)
 
         if self.normOptions.normYtype == 'auto'.lower():
+            module_logger.info( 'Y normalization is ''auto''. Computing normalizations now...' )
             self.normYready = [False] * num_Yfiles
             self.normYoffset = [0] * num_Yfiles
-            self.normYscale = [1] * num_Yfiles
+            self.normYscale = [1] * num_Yfiles            
+            for i in range(num_Yfiles):
+                Yimg = nib.load( self.inputFilesY[i] )
+                tmpY = Yimg.get_fdata()
+                self.normYoffset[i] = np.mean( tmpY )
+                self.normYscale[i] = np.std( tmpY )
+                self.normYready[i] = True
         elif self.normOptions.normYtype == 'fixed'.lower():
             self.normYready = [True] * num_Yfiles
             self.normYoffset = [self.normOptions.normYoffset] * num_Yfiles
@@ -348,22 +625,53 @@ class PairedNiftiGenerator(SingleNiftiGenerator):
             module_logger.error('Fatal Error: Normalization for Y was specified as an unknown value.')
             sys.exit(1)
 
+        # optional function to transform each batch
+        if batchTransformFunction is not None:
+            self.batchTransformFunction = batchTransformFunction
+
+        # set random seed
+        np.random.seed( augOptions.augseed)
+
+        # we are now initialized
+        self.initialized = True
+
     def get_default_normOptions():
+        """Get a Normalization Options namespace for a PairedNiftiGenerator, with the default options
+        Returns
+            a normOptions namespace with the following structure for paired data X and Y:
+                normOptions.normXType = 'none', where the options are 'none', 'auto', 'fixed', and 'function'
+                                        for none, no normalization is done
+                                        for auto, a Z-score normalization is done on the Nifti volume to make mean=0, stdev=1
+                                        for fixed, a specified offset and scaling factor is applied (data-offset)/scale
+                                        for function, a python function is passed that takes the input data and returns a normalized version
+                normOptions.normXoffset = 0, where the value (floating point) is the offset applied to 'fixed' normalization, where the normalization is (data-normXoffset)/normXscale
+                normOptions.normXscale = 0, where the value (floating point) is the scale applied to 'fixed' normalization, where the normalization is (data-normXoffset)/normXscale
+                normOptions.normXfunction = None, where a user-specified function is specified that takes a single dataset as its input and performs a normalization and
+                                            returns new data in the same shape.
+                normOptions.normXinterp = cv2.INTER_CUBIC, which specifies the OpenCV interpolation method that is used when the augmentation transformation is applied.
+                                          valid types are cv2.INTER_NEAREST, cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_AREA, cv2.LANCZOS4, cv2.INTER_LINEAR_EXACT,
+                                              cv2.INTER_NEAREST_EXACT, cv2.INTER_MAX
+                                          see https://docs.opencv.org/3.4/da/d54/group__imgproc__transform.html for more information
+                normOptions.normYType = 'none', where the options are 'none', 'auto', 'fixed', and 'function'
+                                        for none, no normalization is done
+                                        for auto, a Z-score normalization is done on the Nifti volume to make mean=0, stdev=1
+                                        for fixed, a specified offset and scaling factor is applied (data-offset)/scale
+                                        for function, a python function is passed that takes the input data and returns a normalized version
+                normOptions.normYoffset = 0, where the value (floating point) is the offset applied to 'fixed' normalization, where the normalization is (data-normXoffset)/normXscale
+                normOptions.normYscale = 0, where the value (floating point) is the scale applied to 'fixed' normalization, where the normalization is (data-normXoffset)/normXscale
+                normOptions.normYfunction = None, where a user-specified function is specified that takes a single dataset as its input and performs a normalization and
+                                            returns new data in the same shape.
+                normOptions.normYinterp = cv2.INTER_CUBIC, which specifies the OpenCV interpolation method that is used when the augmentation transformation is applied.
+                                          valid types are cv2.INTER_NEAREST, cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_AREA, cv2.LANCZOS4, cv2.INTER_LINEAR_EXACT,
+                                              cv2.INTER_NEAREST_EXACT, cv2.INTER_MAX
+                                          see https://docs.opencv.org/3.4/da/d54/group__imgproc__transform.html for more information                                          
+        """        
         normOptions = types.SimpleNamespace()
 
-        # set normalization options
-        #  type can be 'none', 'auto', 'fixed', 'function'
-        # for none, no normalization is done
-        # for auto, a Z-score normalization is done on the Nifti volume to make mean=0, stdev=1
-        # for fixed, a specified offset and scaling factor is applied (data-offset)/scale
-        # for function, a python function is passed that takes the input data and returns a normalized version
         normOptions.normXtype = 'none'
         normOptions.normXoffset = 0
         normOptions.normXscale = 1
         normOptions.normXfunction = None
-        # interp can be any of the opencv interpolation types: https://docs.opencv.org/3.4/da/d54/group__imgproc__transform.html
-        # cv2.INTER_NEAREST, cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_AREA, cv2.LANCZOS4,
-        # cv2.INTER_LINEAR_EXACT, cv2.INTER_NEAREST_EXACT, cv2.INTER_MAX
         normOptions.normXinterp = cv2.INTER_CUBIC
 
         normOptions.normYtype = 'none'
@@ -373,109 +681,105 @@ class PairedNiftiGenerator(SingleNiftiGenerator):
         normOptions.normXfunction = None
 
         return normOptions
+  
+    def get_batch(self, chunk_size=(32,32,32), batch_size=16):
+        """Get a batch of samples as chunks (samples can be the full image size if desired)
+        Arguments
+            chunk_size - a length-3 tuple, e.g., (32,32,32) that indicates the size of the sampled chunks
+            batch_size - the number of chunks to sample in a batch
+        Returns
+            a batch of paired data
+        """
+        # create empty variables for this batch
+        batch_X = np.zeros( [batch_size,chunk_size[0],chunk_size[1],chunk_size[2]] )
+        batch_Y = np.zeros( [batch_size,chunk_size[0],chunk_size[1],chunk_size[2]] )
 
-    def generate(self, img_size=(256,256), slice_samples=1, batch_size=16):
+        for i in range(batch_size):
+            # get a random subject
+            j = np.random.randint( 0, len(self.inputFilesX) )
+            currImgFileX = self.inputFilesX[j]
+            currImgFileY = self.inputFilesY[j]
 
-        while True:
-            # create empty variables for this batch
-            batch_X = np.zeros( [batch_size,img_size[0],img_size[1],slice_samples] )
-            batch_Y = np.zeros( [batch_size,img_size[0],img_size[1],slice_samples] )
+            # load nifti header
+            module_logger.debug( 'reading files {}, {}'.format(currImgFileX,currImgFileY) )
+            Ximg = nib.load( currImgFileX )
+            Yimg = nib.load( currImgFileY )
 
-            for i in range(batch_size):
-                # get a random subject
-                j = np.random.randint( 0, len(self.inputFilesX) )
-                currImgFileX = self.inputFilesX[j]
-                currImgFileY = self.inputFilesY[j]
+            XimgShape = Ximg.header.get_data_shape()
+            YimgShape = Yimg.header.get_data_shape()
 
-                # load nifti header
-                module_logger.debug( 'reading files {}, {}'.format(currImgFileX,currImgFileY) )
-                Ximg = nib.load( currImgFileX )
-                Yimg = nib.load( currImgFileY )
+            if not XimgShape == YimgShape:
+                module_logger.warning('input data ({} and {}) is not the same size. this may lead to unexpected results or errors!'.format(currImgFileX,currImgFileY))
 
-                XimgShape = Ximg.header.get_data_shape()
-                YimgShape = Yimg.header.get_data_shape()
+            # determine sampling location
+            if chunk_size[0] == XimgShape[0]:
+                x = 0
+            else:
+                x = np.random.randint( 0, XimgShape[0] - chunk_size[0] - 1 )
+            if chunk_size[1] == XimgShape[1]:
+                y = 0
+            else:
+                y = np.random.randint( 0, XimgShape[1] - chunk_size[1] - 1 )
+            if chunk_size[2] == XimgShape[2]:
+                z = 0
+            else:
+                z = np.random.randint( 0, XimgShape[2] - chunk_size[2] - 1 )
 
-                if not XimgShape == YimgShape:
-                    module_logger.warning('input data ({} and {}) is not the same size. this may lead to unexpected results or errors!'.format(currImgFileX,currImgFileY))
+            xe = x + chunk_size[0]
+            ye = y + chunk_size[1]
+            ze = z + chunk_size[2] 
 
-                # determine sampling range
-                if slice_samples==1:
-                    z = np.random.randint( 0, XimgShape[2]-1 )
-                elif slice_samples==3:
-                    z = np.random.randint( 1, XimgShape[2]-2 )
-                elif slice_samples==5:
-                    z = np.random.randint( 2, XimgShape[2]-3 )
-                elif slice_samples==7:
-                    z = np.random.randint( 3, XimgShape[2]-4 )
-                elif slice_samples==9:
-                    z = np.random.randint( 4, XimgShape[2]-5 )
-                else:
-                    module_logger.error('Fatal Error: Number of slice samples must be 1, 3, 5, 7, or 9')
-                    sys.exit(1)                    
+            # handle input data normalization and sampling
+            if self.normOptions.normXtype == 'function'.lower():
+                # normalization is performed via a specified function
+                # get normalized data (and read whole volume)
+                tmpX = self.normOptions.normXfunction( Ximg.get_fdata() )
+                # sample data
+                XimgSlices = tmpX[:,:,z:ze]
+            else:
+                # type is none, auto, or fixed, no computation should be needed
+                # sample data
+                XimgSlices = Ximg.dataobj[:,:,z:ze]
+                # do normalization
+                XimgSlices = (XimgSlices - self.normXoffset[j]) / self.normXscale[j]
 
-                module_logger.debug( 'sampling range is {}'.format(z) )
+            if self.normOptions.normYtype == 'function'.lower():
+                # normalization is performed via a specified function
+                # get normalized data (and read whole volume)
+                tmpY = self.normOptions.normYfunction( Yimg.get_fdata() )
+                # sample data
+                YimgSlices = tmpY[:,:,z:ze]
+            else:
+                # type is none, auto, or fixed, no computation should be needed
+                # sample data
+                YimgSlices = Yimg.dataobj[:,:,z:ze]
+                # do normalization
+                YimgSlices = (YimgSlices - self.normYoffset[j]) / self.normYscale[j]                    
 
-                 # handle input data normalization and sampling
-                if self.normOptions.normXtype == 'function'.lower():
-                    # normalization is performed via a specified function
-                    # get normalized data (and read whole volume)
-                    tmpX = self.normOptions.normXfunction( Ximg.get_fdata() )
-                    # sample data
-                    XimgSlices = tmpX[:,:,z-slice_samples//2:z+slice_samples//2+1]
-                else:
-                    # type is none, auto, or fixed
-                    # prepare normalization
-                    if not self.normXready[j]:
-                        tmpX = Ximg.get_fdata()
-                        self.normXoffset[j] = np.mean( tmpX )
-                        self.normXscale[j] = np.std( tmpX )
-                        self.normXready[j] = True
-                    # sample data
-                    XimgSlices = Ximg.slicer[:,:,z-slice_samples//2:z+slice_samples//2+1].get_fdata()
-                    # do normalization
-                    XimgSlices = (XimgSlices - self.normXoffset[j]) / self.normXscale[j]
+            # ensure 3D matrix if z size is equal to 1
+            if XimgSlices.ndim == 2:
+                XimgSlices = XimgSlices[...,np.newaxis]
+            if YimgSlices.ndim == 2:
+                YimgSlices = YimgSlices[...,np.newaxis]                    
 
-                if self.normOptions.normYtype == 'function'.lower():
-                    # normalization is performed via a specified function
-                    # get normalized data (and read whole volume)
-                    tmpY = self.normOptions.normYfunction( Yimg.get_fdata() )
-                    # sample data
-                    YimgSlices = tmpY[:,:,z-slice_samples//2:z+slice_samples//2+1]
-                else:
-                    # type is none, auto, or fixed
-                    # prepare normalization                    
-                    if not self.normYready[j]:
-                        tmpY = Yimg.get_fdata()
-                        self.normYoffset[j] = np.mean( tmpY )
-                        self.normYscale[j] = np.std( tmpY )
-                        self.normYready[j] = True
-                    # sample data
-                    YimgSlices = Yimg.slicer[:,:,z-slice_samples//2:z+slice_samples//2+1].get_fdata()
-                    # do normalization
-                    YimgSlices = (YimgSlices - self.normYoffset[j]) / self.normYscale[j]
+            # augmentation here
+            M = self.get_augment_transform()
+            XimgSlices = self.do_augment( XimgSlices, M )
+            YimgSlices = self.do_augment( YimgSlices, M )
 
-                # resize to fixed size for model (note img is resized with CUBIC)
-                XimgSlices = cv2.resize( XimgSlices, dsize=(img_size[1],img_size[0]), interpolation = self.normOptions.normXinterp)
-                YimgSlices = cv2.resize( YimgSlices, dsize=(img_size[1],img_size[0]), interpolation = self.normOptions.normYinterp)
+            # sample chunks of data
+            XimgChunk = XimgSlices[x:xe,y:ye,:]
+            YimgChunk = YimgSlices[x:xe,y:ye,:]
 
-                # ensure 3D matrix if batch size is equal to 1
-                if XimgSlices.ndim == 2:
-                    XimgSlices = XimgSlices[...,np.newaxis]
-                if YimgSlices.ndim == 2:
-                    YimgSlices = YimgSlices[...,np.newaxis]
+            # put into data array for batch for this batch of samples
+            batch_X[i,:,:,:] = XimgChunk
+            batch_Y[i,:,:,:] = YimgChunk
 
-                # augmentation here
-                M = self.get_augment_transform()
-                XimgSlices = self.do_augment( XimgSlices, M )
-                YimgSlices = self.do_augment( YimgSlices, M )
+        # optional additional transform to the batch of data
+        if self.batchTransformFunction:
+            batch_X,batch_Y = self.batchTransformFunction( batch_X,batch_Y )
 
-                # if an additional augmentation function is supplied, apply it here
-                if self.augOptions.additionalFunction:
-                    XimgSlices = self.augOptions.additionalFunction( XimgSlices )
-                    YimgSlices = self.augOptions.additionalFunction( YimgSlices )
-
-                # put into data array for batch for this batch of samples
-                batch_X[i,:,:,:] = YimgSlices
-                batch_Y[i,:,:,:] = XimgSlices
-
-                yield (batch_X , batch_Y)
+        return (batch_X , batch_Y)
+# ----------------------------------------------------------------------------------------------------------------------------------------------------------------
+# end PairedNiftiGenerator
+# ----------------------------------------------------------------------------------------------------------------------------------------------------------------
