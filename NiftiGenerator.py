@@ -280,8 +280,7 @@ class SingleNiftiGenerator:
             sys.exit(1)
 
         # optional function to transform each batch
-        if batchTransformFunction is not None:
-            self.batchTransformFunction = batchTransformFunction
+        self.batchTransformFunction = batchTransformFunction
 
         # set random seed
         np.random.seed( augOptions.augseed)
@@ -627,8 +626,7 @@ class PairedNiftiGenerator(SingleNiftiGenerator):
             sys.exit(1)
 
         # optional function to transform each batch
-        if batchTransformFunction is not None:
-            self.batchTransformFunction = batchTransformFunction
+        self.batchTransformFunction = batchTransformFunction
 
         # set random seed
         np.random.seed( augOptions.augseed)
