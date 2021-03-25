@@ -42,7 +42,7 @@ Sampling of each chunk of data is performed after any augmentation.
     # initialize the generator (where x_data_train and y_data_train are either a paths to a single folder or lists of Nifti files)
     niftiGen.initialize( x_data_train, y_data_train, augOptions=niftiGen_augment_opts, normOptions=niftiGen_norm_opts )
     ## in your training function you will then call something like:
-    NiftiGenerator.generate_chunks( niftiGen, chunk_size=(32,32,32), batch_size=64 ) 
+    NiftiGenerator.generate_paired_chunks( niftiGen, chunk_size=(32,32,32), batch_size=64 ) 
     ## to generate a batch of 64, 32x32x32 chunks of paired data
 
 # More advanced things:
