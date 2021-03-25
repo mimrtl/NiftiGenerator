@@ -243,13 +243,13 @@ class SingleNiftiGenerator:
 
         if augOptions is None:
             module_logger.warning( 'No augmentation options were specified.' )
-            self.augOptions = SingleNiftiGenerator.get_default_augOptions()
+            self.augOptions = self.get_default_augOptions()
         else:
             self.augOptions = augOptions
 
         if normOptions is None:
             module_logger.warning( 'No normalization options were specified.' )
-            self.normOptions = SingleNiftiGenerator.get_default_normOptions()
+            self.normOptions = self.get_default_normOptions()
         else:
             self.normOptions = normOptions
 
@@ -283,7 +283,7 @@ class SingleNiftiGenerator:
         self.batchTransformFunction = batchTransformFunction
 
         # set random seed
-        np.random.seed( augOptions.augseed)
+        np.random.seed( self.augOptions.augseed)
 
         # we are now initialized
         self.initialized = True
@@ -564,13 +564,13 @@ class PairedNiftiGenerator(SingleNiftiGenerator):
 
         if augOptions is None:
             module_logger.warning( 'No augmentation options were specified.' )
-            self.augOptions = PairedNiftiGenerator.get_default_augOptions()
+            self.augOptions = self.get_default_augOptions()
         else:
             self.augOptions = augOptions
 
         if normOptions is None:
             module_logger.warning( 'No normalization options were specified.' )
-            self.normOptions = PairedNiftiGenerator.get_default_normOptions()
+            self.normOptions = self.get_default_normOptions()
         else:
             self.normOptions = normOptions
 
@@ -629,7 +629,7 @@ class PairedNiftiGenerator(SingleNiftiGenerator):
         self.batchTransformFunction = batchTransformFunction
 
         # set random seed
-        np.random.seed( augOptions.augseed)
+        np.random.seed( self.augOptions.augseed)
 
         # we are now initialized
         self.initialized = True
